@@ -18,6 +18,14 @@ import {
 } from "./CaptchaSolver";
 import type { IFactura } from "./IFactura";
 import type { IRetencion } from "./IRetencion";
+import { ExecutionState, type DocType } from "./ExecutionState";
+
+/**
+ * Timeouts acotados — nunca 0 (infinito) para evitar cuelgues permanentes.
+ */
+const NAVIGATION_TIMEOUT = 60_000; // 60s para goto/reload
+const DOM_READY_TIMEOUT = 30_000; // 30s para que el DOM renderice
+const SERVER_RESPONSE_TIMEOUT = 60_000; // 60s para respuestas del servidor SRI
 
 /**
  * Alertas del SRI cuando el captcha es rechazado en la respuesta de la
@@ -274,6 +282,30 @@ class SRIScrapper {
   private page?: Page;
   private browser?: Browser;
   private RUC!: string;
+  private password!: string;
+  private state?: ExecutionState;
+
+  /** Obtiene el estado de ejecución (crea uno nuevo si no existe). */
+  private getState(): ExecutionState {
+    if (!this.state) {
+      this.state = new ExecutionState();
+    }
+    return this.state;
+  }
+
+  /** Cierra el browser y la página actuales y crea un contexto limpio. */
+  async RecreateBrowser(): Promise<void> {
+    try {
+      await this.browser?.close();
+    } catch {
+      /* ignore cleanup errors */
+    }
+    this.browser = undefined;
+    this.page = undefined;
+    await this.InitScrapper();
+    await this.Login(this.RUC, this.password);
+    logger.info("Browser recreado y relogueado");
+  }
 
   async InitScrapper() {
     this.browser = await puppeteer.launch({
@@ -309,7 +341,7 @@ class SRIScrapper {
     logger.info("Going to Login");
     await this.page?.goto(
       "https://srienlinea.sri.gob.ec/tuportal-internet/accederAplicacion.jspa?redireccion=57&idGrupo=55",
-      { timeout: 0 },
+      { timeout: NAVIGATION_TIMEOUT },
     );
     // await this.page?.waitForSelector(
     //     'a.ui-button.boton-link:has(div[title="Comprobantes electrónicos recibidos"])'
@@ -354,12 +386,13 @@ class SRIScrapper {
     // );
     // await factButton!.click();
     await this.page?.waitForSelector('select[id="frmPrincipal:ano"]', {
-      timeout: 0,
+      timeout: DOM_READY_TIMEOUT,
     });
   }
 
   async Login(RUC: string, password: string) {
     this.RUC = RUC;
+    this.password = password;
     if (!this.page) await this.InitScrapper();
     await this.NavigateToLogin();
     logger.info("Typing credentials...");
@@ -457,7 +490,7 @@ class SRIScrapper {
     for (;;) {
       const response = await this.page?.waitForResponse(
         (res) => res.url().includes("comprobantesRecibidos.jsf"),
-        { timeout: 0 },
+        { timeout: SERVER_RESPONSE_TIMEOUT },
       );
       if (!response) return undefined;
       let text = "";
@@ -496,7 +529,6 @@ class SRIScrapper {
       throw new Error("Attempts exceeded");
     }
     await this.page?.setUserAgent(new UserAgents().random().toString());
-    const RECAPTCHA_TIMEOUT = 0;
     logger.info("Reloading page...");
     await this.page?.reload();
     logger.info("Typing form for recaptcha...");
@@ -559,7 +591,7 @@ class SRIScrapper {
     }
 
     await this.page?.waitForSelector("span.ui-paginator-current", {
-      timeout: RECAPTCHA_TIMEOUT,
+      timeout: DOM_READY_TIMEOUT,
     });
 
     //Get the number of pages
@@ -577,8 +609,36 @@ class SRIScrapper {
     const retencionesRenta: IRetencion[] = [];
     const retencionesUnknown: IRetencion[] = [];
 
+    // Checkpoint: recuperar progreso y claves ya descargadas
+    const state = this.getState();
+    const docType: DocType = "retenciones";
+    const downloadedClaves = state.getDownloadedClaves(
+      this.RUC,
+      year,
+      month,
+      docType,
+    );
+    const failedClaves = state.getFailedClaves(this.RUC, year, month, docType);
+    let startPage = state.getLastPage(this.RUC, year, month, docType);
+    if (startPage > 0 && startPage < pages!) {
+      logger.info(
+        { startPage, totalPages: pages },
+        "Resumiendo desde página anterior",
+      );
+      for (let p = 0; p < startPage; p++) {
+        await this.page?.$eval(
+          "span.ui-paginator-next.ui-state-default.ui-corner-all",
+          (e) => (e as HTMLSpanElement).click(),
+        );
+        await setTimeout(2000);
+        await this.page?.waitForSelector(
+          'tbody[id="frmPrincipal:tablaCompRecibidos_data"]',
+        );
+      }
+    }
+
     //Get table rows
-    for (let page = 0; page < pages!; page++) {
+    for (let page = startPage; page < pages!; page++) {
       await this.page?.waitForSelector(
         'tbody[id="frmPrincipal:tablaCompRecibidos_data"]',
       );
@@ -596,16 +656,27 @@ class SRIScrapper {
             `No se encontró el link de la clave de acceso en la fila ${index} (patrón 49 dígitos)`,
           );
         }
+
+        // Checkpoint: saltar ya descargados
+        if (downloadedClaves.has(claveAcceso)) {
+          logger.info({ claveAcceso }, "SKIP: ya descargado");
+          continue;
+        }
+        const isRetry = failedClaves.has(claveAcceso);
+        if (isRetry) {
+          logger.warn({ claveAcceso }, "RETRY: descarga previa fallida");
+        }
+
         logger.info("Waiting to get row details...");
         await this.page?.waitForSelector("div.ui-overlay-visible", {
-          timeout: 0,
+          timeout: DOM_READY_TIMEOUT,
         });
         await this.page?.waitForResponse(
           (res) => {
             logger.debug({ url: res.url() }, "Response");
             return res.url().includes("comprobantesRecibidos.jsf");
           },
-          { timeout: 0 },
+          { timeout: SERVER_RESPONSE_TIMEOUT },
         );
         await setTimeout(1000); // Wait for the modal to load
         //Click on the row to download File
@@ -624,136 +695,167 @@ class SRIScrapper {
         logger.info({ downloadPath }, "Creating download path");
         fs.mkdirSync(downloadPath, { recursive: true });
         // POST JSF inline desde el contexto del navegador
-        const lnkPdfId = await row.$eval('a[id*="lnkPdf"]', (e) => e.id || "");
-        const pdfBase64 = await this.page!.evaluate(async (btnId) => {
-          const viewState = (
-            document.querySelector(
-              'input[name="javax.faces.ViewState"]',
-            ) as HTMLInputElement
-          )?.value;
-          if (!viewState) throw new Error("No ViewState found");
+        try {
+          const lnkPdfId = await row.$eval(
+            'a[id*="lnkPdf"]',
+            (e) => e.id || "",
+          );
+          const pdfBase64 = await this.page!.evaluate(async (btnId) => {
+            const viewState = (
+              document.querySelector(
+                'input[name="javax.faces.ViewState"]',
+              ) as HTMLInputElement
+            )?.value;
+            if (!viewState) throw new Error("No ViewState found");
 
-          const params = new URLSearchParams();
-          params.set("frmPrincipal", "frmPrincipal");
-          const opciones = document.querySelector(
-            "input[name='frmPrincipal:opciones']:checked",
-          ) as HTMLInputElement;
-          if (opciones) params.set("frmPrincipal:opciones", opciones.value);
-          for (const [key, selector] of [
-            ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
-            ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
-            ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
-            [
-              "frmPrincipal:cmbTipoComprobante",
-              "select#frmPrincipal\\:cmbTipoComprobante",
-            ],
-          ] as [string, string][]) {
-            const el = document.querySelector(selector) as
-              HTMLSelectElement | HTMLInputElement;
-            if (el?.value) params.set(key, el.value);
+            const params = new URLSearchParams();
+            params.set("frmPrincipal", "frmPrincipal");
+            const opciones = document.querySelector(
+              "input[name='frmPrincipal:opciones']:checked",
+            ) as HTMLInputElement;
+            if (opciones) params.set("frmPrincipal:opciones", opciones.value);
+            for (const [key, selector] of [
+              ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
+              ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
+              ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
+              [
+                "frmPrincipal:cmbTipoComprobante",
+                "select#frmPrincipal\\:cmbTipoComprobante",
+              ],
+            ] as [string, string][]) {
+              const el = document.querySelector(selector) as
+                HTMLSelectElement | HTMLInputElement;
+              if (el?.value) params.set(key, el.value);
+            }
+            const captcha = document.querySelector(
+              "textarea[name='g-recaptcha-response']",
+            ) as HTMLTextAreaElement;
+            params.set("g-recaptcha-response", captcha?.value || "");
+            params.set("javax.faces.ViewState", viewState);
+            params.set(btnId, btnId);
+
+            const resp = await fetch(window.location.href.split("#")[0], {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Referer: window.location.href,
+              },
+              body: params.toString(),
+            });
+            if (!resp.ok) throw new Error(`POST JSF failed: ${resp.status}`);
+            const buf = await resp.arrayBuffer();
+            return btoa(String.fromCharCode(...new Uint8Array(buf)));
+          }, lnkPdfId);
+          const pdfBuffer = Buffer.from(pdfBase64, "base64");
+          const pdfFile = path.join(downloadPath, `comprobante.pdf`);
+          fs.writeFileSync(pdfFile, new Uint8Array(pdfBuffer));
+          logger.info(
+            { pdfFile, size: pdfBuffer.length },
+            "PDF escrito directo",
+          );
+
+          const lnkXmlId = await row.$eval(
+            'a[id*="lnkXml"]',
+            (e) => e.id || "",
+          );
+          if (lnkXmlId) {
+            try {
+              const xmlBase64 = await this.page!.evaluate(async (btnId) => {
+                const viewState = (
+                  document.querySelector(
+                    'input[name="javax.faces.ViewState"]',
+                  ) as HTMLInputElement
+                )?.value;
+                if (!viewState) throw new Error("No ViewState found");
+
+                const params = new URLSearchParams();
+                params.set("frmPrincipal", "frmPrincipal");
+                const opciones = document.querySelector(
+                  "input[name='frmPrincipal:opciones']:checked",
+                ) as HTMLInputElement;
+                if (opciones)
+                  params.set("frmPrincipal:opciones", opciones.value);
+                for (const [key, selector] of [
+                  ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
+                  ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
+                  ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
+                  [
+                    "frmPrincipal:cmbTipoComprobante",
+                    "select#frmPrincipal\\:cmbTipoComprobante",
+                  ],
+                ] as [string, string][]) {
+                  const el = document.querySelector(selector) as
+                    HTMLSelectElement | HTMLInputElement;
+                  if (el?.value) params.set(key, el.value);
+                }
+                const captcha = document.querySelector(
+                  "textarea[name='g-recaptcha-response']",
+                ) as HTMLTextAreaElement;
+                params.set("g-recaptcha-response", captcha?.value || "");
+                params.set("javax.faces.ViewState", viewState);
+                params.set(btnId, btnId);
+
+                const resp = await fetch(window.location.href.split("#")[0], {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    Referer: window.location.href,
+                  },
+                  body: params.toString(),
+                });
+                if (!resp.ok)
+                  throw new Error(`POST JSF failed: ${resp.status}`);
+                const buf = await resp.arrayBuffer();
+                return btoa(String.fromCharCode(...new Uint8Array(buf)));
+              }, lnkXmlId);
+              const xmlBuffer = Buffer.from(xmlBase64, "base64");
+              const xmlFile = path.join(downloadPath, `comprobante.xml`);
+              fs.writeFileSync(xmlFile, new Uint8Array(xmlBuffer));
+              logger.info(
+                { xmlFile, size: xmlBuffer.length },
+                "XML escrito directo",
+              );
+            } catch (err) {
+              logger.warn({ err }, "No se pudo descargar XML, continuando");
+            }
           }
-          const captcha = document.querySelector(
-            "textarea[name='g-recaptcha-response']",
-          ) as HTMLTextAreaElement;
-          params.set("g-recaptcha-response", captcha?.value || "");
-          params.set("javax.faces.ViewState", viewState);
-          params.set(btnId, btnId);
 
-          const resp = await fetch(window.location.href.split("#")[0], {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              Referer: window.location.href,
-            },
-            body: params.toString(),
-          });
-          if (!resp.ok) throw new Error(`POST JSF failed: ${resp.status}`);
-          const buf = await resp.arrayBuffer();
-          return btoa(String.fromCharCode(...new Uint8Array(buf)));
-        }, lnkPdfId);
-        const pdfBuffer = Buffer.from(pdfBase64, "base64");
-        const pdfFile = path.join(downloadPath, `comprobante.pdf`);
-        fs.writeFileSync(pdfFile, new Uint8Array(pdfBuffer));
-        logger.info({ pdfFile, size: pdfBuffer.length }, "PDF escrito directo");
+          logger.info("Get modal...");
+          const { iva, renta, unknown } =
+            await this.parseRetencionDialog(claveAcceso);
+          retencionesIVA.push(...iva);
+          retencionesRenta.push(...renta);
+          retencionesUnknown.push(...unknown);
 
-        const lnkXmlId = await row.$eval('a[id*="lnkXml"]', (e) => e.id || "");
-        if (lnkXmlId) {
-          try {
-            const xmlBase64 = await this.page!.evaluate(async (btnId) => {
-              const viewState = (
-                document.querySelector(
-                  'input[name="javax.faces.ViewState"]',
-                ) as HTMLInputElement
-              )?.value;
-              if (!viewState) throw new Error("No ViewState found");
-
-              const params = new URLSearchParams();
-              params.set("frmPrincipal", "frmPrincipal");
-              const opciones = document.querySelector(
-                "input[name='frmPrincipal:opciones']:checked",
-              ) as HTMLInputElement;
-              if (opciones) params.set("frmPrincipal:opciones", opciones.value);
-              for (const [key, selector] of [
-                ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
-                ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
-                ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
-                [
-                  "frmPrincipal:cmbTipoComprobante",
-                  "select#frmPrincipal\\:cmbTipoComprobante",
-                ],
-              ] as [string, string][]) {
-                const el = document.querySelector(selector) as
-                  HTMLSelectElement | HTMLInputElement;
-                if (el?.value) params.set(key, el.value);
-              }
-              const captcha = document.querySelector(
-                "textarea[name='g-recaptcha-response']",
-              ) as HTMLTextAreaElement;
-              params.set("g-recaptcha-response", captcha?.value || "");
-              params.set("javax.faces.ViewState", viewState);
-              params.set(btnId, btnId);
-
-              const resp = await fetch(window.location.href.split("#")[0], {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  Referer: window.location.href,
-                },
-                body: params.toString(),
-              });
-              if (!resp.ok) throw new Error(`POST JSF failed: ${resp.status}`);
-              const buf = await resp.arrayBuffer();
-              return btoa(String.fromCharCode(...new Uint8Array(buf)));
-            }, lnkXmlId);
-            const xmlBuffer = Buffer.from(xmlBase64, "base64");
-            const xmlFile = path.join(downloadPath, `comprobante.xml`);
-            fs.writeFileSync(xmlFile, new Uint8Array(xmlBuffer));
-            logger.info(
-              { xmlFile, size: xmlBuffer.length },
-              "XML escrito directo",
-            );
-          } catch (err) {
-            logger.warn({ err }, "No se pudo descargar XML, continuando");
-          }
+          // Checkpoint: marcar como descargado
+          state.markProcessed(
+            this.RUC,
+            year,
+            month,
+            docType,
+            claveAcceso,
+            "downloaded",
+            page,
+          );
+        } catch (err) {
+          logger.warn({ err, claveAcceso }, "Error descargando retención");
+          state.markProcessed(
+            this.RUC,
+            year,
+            month,
+            docType,
+            claveAcceso,
+            "failed",
+            page,
+          );
         }
 
-        // logger.info("Waiting download file...");
-        // await this.page?.waitForResponse(
-        //     "https://srienlinea.sri.gob.ec/comprobantes-electronicos-internet/pages/consultas/recibidos/comprobantesRecibidos.jsf",
-        //     { timeout: 0 }
-        // );
-        logger.info("Get modal...");
-        const { iva, renta, unknown } =
-          await this.parseRetencionDialog(claveAcceso);
-        retencionesIVA.push(...iva);
-        retencionesRenta.push(...renta);
-        retencionesUnknown.push(...unknown);
         // Cerrar modal y esperar a que desaparezca
         await this.page?.keyboard.press("Escape");
         await this.page
           ?.waitForSelector("div.ui-overlay-visible", {
             hidden: true,
-            timeout: 5000,
+            timeout: DOM_READY_TIMEOUT,
           })
           .catch(() => {});
         await setTimeout(300);
@@ -764,6 +866,12 @@ class SRIScrapper {
         (e) => (e as HTMLSpanElement).click(),
       );
       await setTimeout(2000);
+      // Esperar que el DOM se estabilice antes de re-leer filas
+      await this.page?.waitForSelector(
+        'tbody[id="frmPrincipal:tablaCompRecibidos_data"]',
+      );
+      // Checkpoint: guardar progreso de página
+      state.setLastPage(this.RUC, year, month, docType, page + 1);
     }
 
     return {
@@ -782,7 +890,6 @@ class SRIScrapper {
       throw new Error("Attempts exceeded");
     }
     await this.page?.setUserAgent(new UserAgents().random().toString());
-    const RECAPTCHA_TIMEOUT = 0;
     logger.info("Reloading page...");
     await this.page?.reload();
     logger.info("Typing form for recaptcha...");
@@ -841,7 +948,7 @@ class SRIScrapper {
     }
 
     await this.page?.waitForSelector("span.ui-paginator-current", {
-      timeout: RECAPTCHA_TIMEOUT,
+      timeout: DOM_READY_TIMEOUT,
     });
 
     //Get the number of pages
@@ -857,8 +964,36 @@ class SRIScrapper {
     logger.info({ pages }, "Number of pages");
     const facturas: IFactura[] = [];
 
+    // Checkpoint: recuperar progreso y claves ya descargadas
+    const state = this.getState();
+    const docType: DocType = "facturas";
+    const downloadedClaves = state.getDownloadedClaves(
+      this.RUC,
+      year,
+      month,
+      docType,
+    );
+    const failedClaves = state.getFailedClaves(this.RUC, year, month, docType);
+    let startPage = state.getLastPage(this.RUC, year, month, docType);
+    if (startPage > 0 && startPage < pages!) {
+      logger.info(
+        { startPage, totalPages: pages },
+        "Resumiendo desde página anterior",
+      );
+      for (let p = 0; p < startPage; p++) {
+        await this.page?.$eval(
+          "span.ui-paginator-next.ui-state-default.ui-corner-all",
+          (e) => (e as HTMLSpanElement).click(),
+        );
+        await setTimeout(2000);
+        await this.page?.waitForSelector(
+          'tbody[id="frmPrincipal:tablaCompRecibidos_data"]',
+        );
+      }
+    }
+
     //Get table rows
-    for (let page = 0; page < pages!; page++) {
+    for (let page = startPage; page < pages!; page++) {
       await this.page?.waitForSelector(
         'tbody[id="frmPrincipal:tablaCompRecibidos_data"]',
       );
@@ -876,13 +1011,30 @@ class SRIScrapper {
             `No se encontró el link de la clave de acceso en la fila ${index} (patrón 49 dígitos)`,
           );
         }
+
+        // Checkpoint: saltar ya descargados
+        if (downloadedClaves.has(claveAccesoFromRow)) {
+          logger.info(
+            { claveAcceso: claveAccesoFromRow },
+            "SKIP: ya descargado",
+          );
+          continue;
+        }
+        const isRetry = failedClaves.has(claveAccesoFromRow);
+        if (isRetry) {
+          logger.warn(
+            { claveAcceso: claveAccesoFromRow },
+            "RETRY: descarga previa fallida",
+          );
+        }
+
         logger.info("Waiting to get row details...");
         await this.page?.waitForSelector("div.ui-overlay-visible", {
-          timeout: 0,
+          timeout: DOM_READY_TIMEOUT,
         });
         await this.page?.waitForResponse(
           (res) => res.url().includes("comprobantesRecibidos.jsf"),
-          { timeout: 0 },
+          { timeout: SERVER_RESPONSE_TIMEOUT },
         );
         await setTimeout(1000); // Wait for the modal to load
         //Click on the row to download File
@@ -908,119 +1060,158 @@ class SRIScrapper {
         logger.info({ downloadPath }, "Creating download path");
         fs.mkdirSync(downloadPath, { recursive: true });
         // POST JSF inline desde el contexto del navegador
-        const lnkPdfId = await row.$eval('a[id*="lnkPdf"]', (e) => e.id || "");
-        const pdfBase64 = await this.page!.evaluate(async (btnId) => {
-          const viewState = (
-            document.querySelector(
-              'input[name="javax.faces.ViewState"]',
-            ) as HTMLInputElement
-          )?.value;
-          if (!viewState) throw new Error("No ViewState found");
+        try {
+          const lnkPdfId = await row.$eval(
+            'a[id*="lnkPdf"]',
+            (e) => e.id || "",
+          );
+          const pdfBase64 = await this.page!.evaluate(async (btnId) => {
+            const viewState = (
+              document.querySelector(
+                'input[name="javax.faces.ViewState"]',
+              ) as HTMLInputElement
+            )?.value;
+            if (!viewState) throw new Error("No ViewState found");
 
-          const params = new URLSearchParams();
-          params.set("frmPrincipal", "frmPrincipal");
-          const opciones = document.querySelector(
-            "input[name='frmPrincipal:opciones']:checked",
-          ) as HTMLInputElement;
-          if (opciones) params.set("frmPrincipal:opciones", opciones.value);
-          for (const [key, selector] of [
-            ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
-            ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
-            ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
-            [
-              "frmPrincipal:cmbTipoComprobante",
-              "select#frmPrincipal\\:cmbTipoComprobante",
-            ],
-          ] as [string, string][]) {
-            const el = document.querySelector(selector) as
-              HTMLSelectElement | HTMLInputElement;
-            if (el?.value) params.set(key, el.value);
+            const params = new URLSearchParams();
+            params.set("frmPrincipal", "frmPrincipal");
+            const opciones = document.querySelector(
+              "input[name='frmPrincipal:opciones']:checked",
+            ) as HTMLInputElement;
+            if (opciones) params.set("frmPrincipal:opciones", opciones.value);
+            for (const [key, selector] of [
+              ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
+              ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
+              ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
+              [
+                "frmPrincipal:cmbTipoComprobante",
+                "select#frmPrincipal\\:cmbTipoComprobante",
+              ],
+            ] as [string, string][]) {
+              const el = document.querySelector(selector) as
+                HTMLSelectElement | HTMLInputElement;
+              if (el?.value) params.set(key, el.value);
+            }
+            const captcha = document.querySelector(
+              "textarea[name='g-recaptcha-response']",
+            ) as HTMLTextAreaElement;
+            params.set("g-recaptcha-response", captcha?.value || "");
+            params.set("javax.faces.ViewState", viewState);
+            params.set(btnId, btnId);
+
+            const resp = await fetch(window.location.href.split("#")[0], {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Referer: window.location.href,
+              },
+              body: params.toString(),
+            });
+            if (!resp.ok) throw new Error(`POST JSF failed: ${resp.status}`);
+            const buf = await resp.arrayBuffer();
+            return btoa(String.fromCharCode(...new Uint8Array(buf)));
+          }, lnkPdfId);
+          const pdfBuffer = Buffer.from(pdfBase64, "base64");
+          const pdfFile = path.join(downloadPath, `comprobante.pdf`);
+          fs.writeFileSync(pdfFile, new Uint8Array(pdfBuffer));
+          logger.info(
+            { pdfFile, size: pdfBuffer.length },
+            "PDF escrito directo",
+          );
+
+          const lnkXmlId = await row.$eval(
+            'a[id*="lnkXml"]',
+            (e) => e.id || "",
+          );
+          if (lnkXmlId) {
+            try {
+              const xmlBase64 = await this.page!.evaluate(async (btnId) => {
+                const viewState = (
+                  document.querySelector(
+                    'input[name="javax.faces.ViewState"]',
+                  ) as HTMLInputElement
+                )?.value;
+                if (!viewState) throw new Error("No ViewState found");
+
+                const params = new URLSearchParams();
+                params.set("frmPrincipal", "frmPrincipal");
+                const opciones = document.querySelector(
+                  "input[name='frmPrincipal:opciones']:checked",
+                ) as HTMLInputElement;
+                if (opciones)
+                  params.set("frmPrincipal:opciones", opciones.value);
+                for (const [key, selector] of [
+                  ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
+                  ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
+                  ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
+                  [
+                    "frmPrincipal:cmbTipoComprobante",
+                    "select#frmPrincipal\\:cmbTipoComprobante",
+                  ],
+                ] as [string, string][]) {
+                  const el = document.querySelector(selector) as
+                    HTMLSelectElement | HTMLInputElement;
+                  if (el?.value) params.set(key, el.value);
+                }
+                const captcha = document.querySelector(
+                  "textarea[name='g-recaptcha-response']",
+                ) as HTMLTextAreaElement;
+                params.set("g-recaptcha-response", captcha?.value || "");
+                params.set("javax.faces.ViewState", viewState);
+                params.set(btnId, btnId);
+
+                const resp = await fetch(window.location.href.split("#")[0], {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    Referer: window.location.href,
+                  },
+                  body: params.toString(),
+                });
+                if (!resp.ok)
+                  throw new Error(`POST JSF failed: ${resp.status}`);
+                const buf = await resp.arrayBuffer();
+                return btoa(String.fromCharCode(...new Uint8Array(buf)));
+              }, lnkXmlId);
+              const xmlBuffer = Buffer.from(xmlBase64, "base64");
+              const xmlFile = path.join(downloadPath, `comprobante.xml`);
+              fs.writeFileSync(xmlFile, new Uint8Array(xmlBuffer));
+              logger.info(
+                { xmlFile, size: xmlBuffer.length },
+                "XML escrito directo",
+              );
+            } catch (err) {
+              logger.warn({ err }, "No se pudo descargar XML, continuando");
+            }
           }
-          const captcha = document.querySelector(
-            "textarea[name='g-recaptcha-response']",
-          ) as HTMLTextAreaElement;
-          params.set("g-recaptcha-response", captcha?.value || "");
-          params.set("javax.faces.ViewState", viewState);
-          params.set(btnId, btnId);
+          facturas.push(factura);
 
-          const resp = await fetch(window.location.href.split("#")[0], {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/x-www-form-urlencoded",
-              Referer: window.location.href,
-            },
-            body: params.toString(),
-          });
-          if (!resp.ok) throw new Error(`POST JSF failed: ${resp.status}`);
-          const buf = await resp.arrayBuffer();
-          return btoa(String.fromCharCode(...new Uint8Array(buf)));
-        }, lnkPdfId);
-        const pdfBuffer = Buffer.from(pdfBase64, "base64");
-        const pdfFile = path.join(downloadPath, `comprobante.pdf`);
-        fs.writeFileSync(pdfFile, new Uint8Array(pdfBuffer));
-        logger.info({ pdfFile, size: pdfBuffer.length }, "PDF escrito directo");
-
-        const lnkXmlId = await row.$eval('a[id*="lnkXml"]', (e) => e.id || "");
-        if (lnkXmlId) {
-          try {
-            const xmlBase64 = await this.page!.evaluate(async (btnId) => {
-              const viewState = (
-                document.querySelector(
-                  'input[name="javax.faces.ViewState"]',
-                ) as HTMLInputElement
-              )?.value;
-              if (!viewState) throw new Error("No ViewState found");
-
-              const params = new URLSearchParams();
-              params.set("frmPrincipal", "frmPrincipal");
-              const opciones = document.querySelector(
-                "input[name='frmPrincipal:opciones']:checked",
-              ) as HTMLInputElement;
-              if (opciones) params.set("frmPrincipal:opciones", opciones.value);
-              for (const [key, selector] of [
-                ["frmPrincipal:ano", "select#frmPrincipal\\:ano"],
-                ["frmPrincipal:mes", "select#frmPrincipal\\:mes"],
-                ["frmPrincipal:dia", "select#frmPrincipal\\:dia"],
-                [
-                  "frmPrincipal:cmbTipoComprobante",
-                  "select#frmPrincipal\\:cmbTipoComprobante",
-                ],
-              ] as [string, string][]) {
-                const el = document.querySelector(selector) as
-                  HTMLSelectElement | HTMLInputElement;
-                if (el?.value) params.set(key, el.value);
-              }
-              const captcha = document.querySelector(
-                "textarea[name='g-recaptcha-response']",
-              ) as HTMLTextAreaElement;
-              params.set("g-recaptcha-response", captcha?.value || "");
-              params.set("javax.faces.ViewState", viewState);
-              params.set(btnId, btnId);
-
-              const resp = await fetch(window.location.href.split("#")[0], {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                  Referer: window.location.href,
-                },
-                body: params.toString(),
-              });
-              if (!resp.ok) throw new Error(`POST JSF failed: ${resp.status}`);
-              const buf = await resp.arrayBuffer();
-              return btoa(String.fromCharCode(...new Uint8Array(buf)));
-            }, lnkXmlId);
-            const xmlBuffer = Buffer.from(xmlBase64, "base64");
-            const xmlFile = path.join(downloadPath, `comprobante.xml`);
-            fs.writeFileSync(xmlFile, new Uint8Array(xmlBuffer));
-            logger.info(
-              { xmlFile, size: xmlBuffer.length },
-              "XML escrito directo",
-            );
-          } catch (err) {
-            logger.warn({ err }, "No se pudo descargar XML, continuando");
-          }
+          // Checkpoint: marcar como descargado
+          state.markProcessed(
+            this.RUC,
+            year,
+            month,
+            docType,
+            factura.claveAcceso,
+            "downloaded",
+            page,
+          );
+        } catch (err) {
+          logger.warn(
+            { err, claveAcceso: factura.claveAcceso },
+            "Error descargando factura",
+          );
+          state.markProcessed(
+            this.RUC,
+            year,
+            month,
+            docType,
+            factura.claveAcceso,
+            "failed",
+            page,
+          );
         }
-        facturas.push(factura);
+
         // Cerrar modal para poder interactuar con la tabla
         await this.page?.keyboard.press("Escape");
         await setTimeout(500);
@@ -1030,7 +1221,17 @@ class SRIScrapper {
         "span.ui-paginator-next.ui-state-default.ui-corner-all",
         (e) => (e as HTMLSpanElement).click(),
       );
+      // Re-leer filas después de paginar para evitar handles stale
+      await this.page?.waitForSelector(
+        'tbody[id="frmPrincipal:tablaCompRecibidos_data"]',
+      );
+      await setTimeout(2000);
+      // Checkpoint: guardar progreso de página
+      state.setLastPage(this.RUC, year, month, docType, page + 1);
     }
+
+    // Checkpoint: marcar mes completado
+    state.markMonthCompleted(this.RUC, year, month, docType);
 
     return facturas;
   }
@@ -1258,12 +1459,39 @@ class SRIScrapper {
   ) {
     const facturas: IFactura[] = [];
     for (let month = monthStart; month <= monthEnd; month++) {
-      const monthFacturas = await this.GetFacturasPerMonth(month, year);
-      facturas.push(...monthFacturas);
-      yield {
-        facturas: monthFacturas,
-        month,
-      };
+      // Checkpoint: saltar meses ya completados
+      const state = this.getState();
+      if (state.isMonthCompleted(this.RUC, year, month, "facturas")) {
+        logger.info({ month, year }, "SKIP: mes ya completado");
+        continue;
+      }
+      const maxRetries = 3;
+      let success = false;
+      for (let attempt = 1; attempt <= maxRetries && !success; attempt++) {
+        try {
+          const monthFacturas = await this.GetFacturasPerMonth(month, year);
+          facturas.push(...monthFacturas);
+          yield {
+            facturas: monthFacturas,
+            month,
+          };
+          success = true;
+        } catch (err) {
+          logger.warn(
+            { err, month, year, attempt },
+            "Error en GetFacturasPerMonth, recreando browser...",
+          );
+          if (attempt < maxRetries) {
+            await this.RecreateBrowser();
+            await setTimeout(2000 * attempt); // backoff progresivo
+          } else {
+            logger.error(
+              { err, month, year },
+              "Agotados reintentos, mes fallido",
+            );
+          }
+        }
+      }
     }
     return facturas;
   }
@@ -1277,19 +1505,46 @@ class SRIScrapper {
     const retencionesRenta: IRetencion[] = [];
     const retencionesUnknown: IRetencion[] = [];
     for (let month = monthStart; month <= monthEnd; month++) {
-      const { iva, renta, unknown } = await this.GetRetencionesPerMonth(
-        month,
-        year,
-      );
-      retencionesIVA.push(...iva);
-      retencionesRenta.push(...renta);
-      retencionesUnknown.push(...unknown);
-      yield {
-        iva,
-        renta,
-        unknown,
-        month,
-      };
+      // Checkpoint: saltar meses ya completados
+      const state = this.getState();
+      if (state.isMonthCompleted(this.RUC, year, month, "retenciones")) {
+        logger.info({ month, year }, "SKIP: mes ya completado");
+        continue;
+      }
+      const maxRetries = 3;
+      let success = false;
+      for (let attempt = 1; attempt <= maxRetries && !success; attempt++) {
+        try {
+          const { iva, renta, unknown } = await this.GetRetencionesPerMonth(
+            month,
+            year,
+          );
+          retencionesIVA.push(...iva);
+          retencionesRenta.push(...renta);
+          retencionesUnknown.push(...unknown);
+          yield {
+            iva,
+            renta,
+            unknown,
+            month,
+          };
+          success = true;
+        } catch (err) {
+          logger.warn(
+            { err, month, year, attempt },
+            "Error en GetRetencionesPerMonth, recreando browser...",
+          );
+          if (attempt < maxRetries) {
+            await this.RecreateBrowser();
+            await setTimeout(2000 * attempt); // backoff progresivo
+          } else {
+            logger.error(
+              { err, month, year },
+              "Agotados reintentos, mes fallido",
+            );
+          }
+        }
+      }
     }
     return {
       iva: retencionesIVA,
@@ -1299,6 +1554,7 @@ class SRIScrapper {
   }
 
   async EndScrapper() {
+    this.state?.close();
     // await this.browser?.close();
   }
 }
