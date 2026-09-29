@@ -3,105 +3,199 @@ import fs from "fs";
 import { WriteRetencionesIVA } from "./src/Excel/serializeIVA.js";
 import { WriteRetencionesRenta } from "./src/Excel/serializeRenta.js";
 import { WriteRetencionesUnknown } from "./src/Excel/serializeUnknown.js";
+import { WriteFacturas } from "./src/Excel/serializeFactura.js";
 import SRIScrapper from "./src/SRI/SRIScrapper.ts";
 import { Months } from "./src/utils/months.ts";
 import type { IRetencion } from "./src/SRI/IRetencion.ts";
+import type { IFactura } from "./src/SRI/IFactura.ts";
 import { JoinRawJsons } from "./src/utils/json.ts";
+import { runMenu } from "./src/cli/menu.ts";
+import { logger, printLogLocation } from "./src/utils/logger.ts";
 
-const RUC = "1792734134001";
-const password = "Tomas1792***";
-const year = 2024;
+function ensureParentDir(filePath: string) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
 
-async function bootstrap() {
-    if (!fs.existsSync(path.resolve(`./${RUC}`))) {
-        fs.mkdirSync(path.resolve(`./${RUC}`));
-    }
-    const startTime = performance.now();
-    await SRIScrapper.Login(RUC, password);
-    for await (const retenciones of SRIScrapper.GetRetencionesPerYear(year)) {
-        console.log("Saving JSON result", JSON.stringify(retenciones, null, 2));
-        fs.writeFileSync(
-            path.resolve(
-                `./${RUC}/Comprobantes/${year}/${
-                    Months[retenciones.month]
-                }/raw_result.json`
-            ),
-            JSON.stringify(retenciones, null, 2)
-        );
-        WriteRetencionesIVA(
-            retenciones.iva,
-            path.resolve(
-                `./${RUC}/Comprobantes/${year}/${Months[retenciones.month]}`,
-                `IVA.xlsx`
-            )
-        );
-        WriteRetencionesRenta(
-            retenciones.renta,
-            path.resolve(
-                `./${RUC}/Comprobantes/${year}/${Months[retenciones.month]}`,
-                `RENTA.xlsx`
-            )
-        );
-        WriteRetencionesUnknown(
-            retenciones.unknown,
-            path.resolve(
-                `./${RUC}/Comprobantes/${year}/${Months[retenciones.month]}`,
-                `UNKNOWN.xlsx`
-            )
-        );
-    }
-    await SRIScrapper.EndScrapper();
-    const endTime = performance.now();
-    console.log("Finished, time elapsed:", endTime - startTime);
+function monthDirsForRange(
+  ruc: string,
+  year: number,
+  monthStart: number,
+  monthEnd: number,
+) {
+  const yearDir = path.resolve(`./${ruc}/Comprobantes/${year}`);
+  if (!fs.existsSync(yearDir)) return [];
+  return fs
+    .readdirSync(yearDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(yearDir, entry.name))
+    .filter((fullPath) => {
+      const monthFile = fs.existsSync(path.join(fullPath, "raw_result.json"))
+        ? "raw_result.json"
+        : fs.existsSync(path.join(fullPath, "facturas_result.json"))
+          ? "facturas_result.json"
+          : null;
+      if (monthFile === null) return false;
+      const parsed = JSON.parse(
+        fs.readFileSync(path.join(fullPath, monthFile), "utf-8"),
+      ) as { month: number };
+      return parsed.month >= monthStart && parsed.month <= monthEnd;
+    });
+}
 
-    // Join all the raw_result.json files into one
-    const entries = fs.readdirSync(
-        path.resolve(`./${RUC}/Comprobantes/${year}`),
-        {
-            withFileTypes: true,
-        }
+async function downloadRetenciones(
+  ruc: string,
+  year: number,
+  monthStart: number,
+  monthEnd: number,
+) {
+  for await (const retenciones of SRIScrapper.GetRetencionesPerYear(
+    year,
+    monthStart,
+    monthEnd,
+  )) {
+    logger.info(
+      {
+        month: retenciones.month,
+        iva: retenciones.iva.length,
+        renta: retenciones.renta.length,
+        unknown: retenciones.unknown.length,
+      },
+      "Saving JSON result",
     );
-    const rawResults = [] as Array<{
+    const monthDir = path.resolve(
+      `./${ruc}/Comprobantes/${year}/${Months[retenciones.month]}`,
+    );
+    const rawResultPath = path.join(monthDir, "raw_result.json");
+    ensureParentDir(rawResultPath);
+    fs.writeFileSync(rawResultPath, JSON.stringify(retenciones, null, 2));
+    WriteRetencionesIVA(retenciones.iva, path.join(monthDir, "IVA.xlsx"));
+    WriteRetencionesRenta(retenciones.renta, path.join(monthDir, "RENTA.xlsx"));
+    WriteRetencionesUnknown(
+      retenciones.unknown,
+      path.join(monthDir, "UNKNOWN.xlsx"),
+    );
+  }
+
+  // Join all the raw_result.json files of the selected months into one
+  const rawResults = [] as Array<{
+    iva: IRetencion[];
+    renta: IRetencion[];
+    unknown: IRetencion[];
+    month: number;
+  }>;
+  for (const fullPath of monthDirsForRange(ruc, year, monthStart, monthEnd)) {
+    const rawResultPath = path.join(fullPath, "raw_result.json");
+    if (fs.existsSync(rawResultPath)) {
+      const rawResult = JSON.parse(fs.readFileSync(rawResultPath, "utf-8")) as {
         iva: IRetencion[];
         renta: IRetencion[];
         unknown: IRetencion[];
         month: number;
-    }>;
-    for (const entry of entries) {
-        if (entry.isDirectory()) {
-            const fullPath = path.join(
-                path.resolve(`./${RUC}/Comprobantes/${year}`),
-                entry.name
-            );
-            const rawResultPath = path.join(fullPath, "raw_result.json");
-            if (fs.existsSync(rawResultPath)) {
-                const rawResult = JSON.parse(
-                    fs.readFileSync(rawResultPath, "utf-8")
-                ) as {
-                    iva: IRetencion[];
-                    renta: IRetencion[];
-                    unknown: IRetencion[];
-                    month: number;
-                };
-                rawResults.push(rawResult);
-            } else {
-                console.warn(
-                    `No raw_result.json found in ${fullPath}, skipping...`
-                );
-            }
-        }
+      };
+      rawResults.push(rawResult);
+    } else {
+      logger.warn(`No raw_result.json found in ${fullPath}, skipping...`);
     }
-    const joined = JoinRawJsons(rawResults);
-    fs.writeFileSync(
-        path.resolve(`./${RUC}`, `raw_result.json`),
-        JSON.stringify(joined, null, 2)
-    );
-    WriteRetencionesIVA(joined.iva, path.resolve(`./${RUC}`, `IVA.xlsx`));
-    WriteRetencionesRenta(joined.renta, path.resolve(`./${RUC}`, `RENTA.xlsx`));
-    WriteRetencionesUnknown(
-        joined.unknown,
-        path.resolve(`./${RUC}`, `UNKNOWN.xlsx`)
-    );
+  }
+  const joined = JoinRawJsons(rawResults);
+  const joinedRawPath = path.resolve(`./${ruc}`, "raw_result.json");
+  ensureParentDir(joinedRawPath);
+  fs.writeFileSync(joinedRawPath, JSON.stringify(joined, null, 2));
+  WriteRetencionesIVA(joined.iva, path.resolve(`./${ruc}`, "IVA.xlsx"));
+  WriteRetencionesRenta(joined.renta, path.resolve(`./${ruc}`, "RENTA.xlsx"));
+  WriteRetencionesUnknown(
+    joined.unknown,
+    path.resolve(`./${ruc}`, "UNKNOWN.xlsx"),
+  );
 }
 
-bootstrap();
+async function downloadFacturas(
+  ruc: string,
+  year: number,
+  monthStart: number,
+  monthEnd: number,
+) {
+  for await (const facturas of SRIScrapper.GetFacturasPerYear(
+    year,
+    monthStart,
+    monthEnd,
+  )) {
+    logger.info(
+      { month: facturas.month, facturas: facturas.facturas.length },
+      "Saving JSON result",
+    );
+    const monthDir = path.resolve(
+      `./${ruc}/Comprobantes/${year}/${Months[facturas.month]}`,
+    );
+    const resultPath = path.join(monthDir, "facturas_result.json");
+    ensureParentDir(resultPath);
+    fs.writeFileSync(
+      resultPath,
+      JSON.stringify(
+        { facturas: facturas.facturas, month: facturas.month },
+        null,
+        2,
+      ),
+    );
+    WriteFacturas(facturas.facturas, path.join(monthDir, "FACTURAS.xlsx"));
+  }
+
+  // Join all the facturas_result.json files of the selected months into one
+  const facturas: IFactura[] = [];
+  for (const fullPath of monthDirsForRange(ruc, year, monthStart, monthEnd)) {
+    const resultPath = path.join(fullPath, "facturas_result.json");
+    if (fs.existsSync(resultPath)) {
+      const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as {
+        facturas: IFactura[];
+        month: number;
+      };
+      facturas.push(...result.facturas);
+    } else {
+      logger.warn(`No facturas_result.json found in ${fullPath}, skipping...`);
+    }
+  }
+  const joinedPath = path.resolve(`./${ruc}`, "facturas.json");
+  ensureParentDir(joinedPath);
+  fs.writeFileSync(joinedPath, JSON.stringify({ facturas }, null, 2));
+  WriteFacturas(facturas, path.resolve(`./${ruc}`, "FACTURAS.xlsx"));
+}
+
+async function bootstrap() {
+  const result = await runMenu();
+  if (!result) {
+    logger.info("Saliendo...");
+    printLogLocation();
+    return;
+  }
+  const { tipo, ruc, password, year, month } = result;
+  const monthStart = month ?? 1;
+  const monthEnd = month ?? 12;
+  logger.info(
+    `Descargando ${tipo} del ${year}${
+      month ? ` (mes: ${Months[month]})` : " (todo el año)"
+    }...`,
+  );
+  if (!fs.existsSync(path.resolve(`./${ruc}`))) {
+    fs.mkdirSync(path.resolve(`./${ruc}`));
+  }
+  const startTime = performance.now();
+  await SRIScrapper.Login(ruc, password);
+  if (tipo === "retenciones") {
+    await downloadRetenciones(ruc, year, monthStart, monthEnd);
+  } else {
+    await downloadFacturas(ruc, year, monthStart, monthEnd);
+  }
+  await SRIScrapper.EndScrapper();
+  const endTime = performance.now();
+  logger.info({ elapsedMs: Math.round(endTime - startTime) }, "Finished");
+  printLogLocation();
+}
+
+bootstrap().catch((error) => {
+  logger.error(
+    { err: error instanceof Error ? error.stack : String(error) },
+    "Ejecución fallida",
+  );
+  printLogLocation();
+  process.exitCode = 1;
+});

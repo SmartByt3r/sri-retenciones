@@ -6,10 +6,11 @@
         "start": "bun main.ts"
     },
     "dependencies": {
+        "@clack/prompts": "^1.8.1",
         "excel4node": "^1.8.0",
+        "pino": "^10.3.1",
         "puppeteer": "^23.9.0",
         "puppeteer-extra": "^3.3.6",
-        "puppeteer-extra-plugin-recaptcha": "^3.6.8",
         "puppeteer-extra-plugin-stealth": "^2.11.1",
         "user-agents": "^1.1.364"
     },
