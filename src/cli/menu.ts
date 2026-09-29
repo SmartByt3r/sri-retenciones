@@ -16,6 +16,8 @@ export interface MenuResult {
   year: number;
   /** Mes seleccionado (1-12). `undefined` = todo el año. */
   month?: number;
+  /** Directorio base de descarga (default: "." = directorio actual). */
+  downloadPath: string;
 }
 
 /**
@@ -109,6 +111,18 @@ export async function runMenu(): Promise<MenuResult | null> {
     month = monthSelection;
   }
 
+  const downloadPathInput = await text({
+    message: "Directorio de descarga (Enter = directorio actual)",
+    placeholder: ".",
+    validate: () => undefined, // siempre válido
+  });
+  if (isCancel(downloadPathInput)) {
+    cancel("Operación cancelada");
+    return null;
+  }
+  const downloadPath =
+    downloadPathInput.trim() === "" ? "." : downloadPathInput.trim();
+
   outro("Iniciando descarga...");
 
   return {
@@ -117,5 +131,6 @@ export async function runMenu(): Promise<MenuResult | null> {
     password: clave.trim(),
     year,
     month,
+    downloadPath,
   };
 }

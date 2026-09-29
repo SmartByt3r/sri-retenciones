@@ -209,22 +209,31 @@ export function mapRetencionFromDialog(
   return result;
 }
 
-const CHROME_CANDIDATES = [
+/**
+ * Rutas candidatas de Chrome/Chromium por plataforma.
+ */
+const CHROME_LINUX = [
   "/usr/bin/google-chrome",
   "/usr/bin/google-chrome-stable",
   "/usr/bin/chromium",
   "/usr/bin/chromium-browser",
+  "/snap/bin/chromium",
+  "/snap/bin/google-chrome",
+];
+
+const CHROME_WINDOWS = [
+  String.raw`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+  String.raw`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+  String.raw`C:\Users\%USERNAME%\AppData\Local\Google\Chrome\Application\chrome.exe`,
 ];
 
 /**
- * Resuelve el ejecutable de Chrome/Chromium para puppeteer, en este orden:
- * 1. Variable de entorno CHROME_PATH (útil en WSL u otras rutas custom)
- * 2. Chrome/Chromium instalado en el sistema (rutas habituales de Linux)
- * 3. El Chrome empaquetado de puppeteer (~/.cache/puppeteer/chrome)
+ * Resuelve el ejecutable de Chrome/Chromium para puppeteer, cross-platform.
+ * Orden de resolución:
+ * 1. Variable de entorno CHROME_PATH (override explícito)
+ * 2. Rutas del sistema según plataforma (Linux / Windows)
+ * 3. Chrome empaquetado de puppeteer (~/.cache/puppeteer/chrome)
  * Lanza un error accionable si no encuentra ninguno.
- * Nota WSL: NO apuntes al chrome.exe de Windows — puppeteer no podría
- * conectarse al puerto de DevTools (localhost distinto en NAT) y las rutas
- * de descarga de Linux no existen para el proceso de Windows.
  */
 export function resolveChromePath(): string {
   const envPath = process.env.CHROME_PATH;
@@ -236,46 +245,131 @@ export function resolveChromePath(): string {
     }
     return envPath;
   }
-  for (const candidate of CHROME_CANDIDATES) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  // Chrome empaquetado de puppeteer:
-  // ~/.cache/puppeteer/chrome/linux-<version>/chrome-linux64/chrome
-  const chromeCache = path.join(
-    process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"),
-    "puppeteer",
-    "chrome",
-  );
-  if (fs.existsSync(chromeCache)) {
-    const entries = fs
-      .readdirSync(chromeCache)
-      .sort()
-      .filter(
-        (entry) =>
-          fs.existsSync(
-            path.join(chromeCache, entry, "chrome-linux64", "chrome"),
-          ) ||
-          fs.existsSync(
-            path.join(chromeCache, entry, "chrome-linux", "chrome"),
-          ),
-      );
-    if (entries.length > 0) {
-      const latest = entries[entries.length - 1];
-      const linux64 = path.join(
-        chromeCache,
-        latest,
-        "chrome-linux64",
-        "chrome",
-      );
-      if (fs.existsSync(linux64)) return linux64;
-      return path.join(chromeCache, latest, "chrome-linux", "chrome");
+
+  const platform = os.platform();
+
+  // --- Linux ---
+  if (platform === "linux") {
+    for (const candidate of CHROME_LINUX) {
+      if (fs.existsSync(candidate)) return candidate;
     }
+    // puppeteer cache: ~/.cache/puppeteer/chrome/linux-<version>/chrome-linux64/chrome
+    const chromeCache = path.join(
+      process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"),
+      "puppeteer",
+      "chrome",
+    );
+    if (fs.existsSync(chromeCache)) {
+      const entries = fs
+        .readdirSync(chromeCache)
+        .sort()
+        .filter(
+          (entry) =>
+            fs.existsSync(
+              path.join(chromeCache, entry, "chrome-linux64", "chrome"),
+            ) ||
+            fs.existsSync(
+              path.join(chromeCache, entry, "chrome-linux", "chrome"),
+            ),
+        );
+      if (entries.length > 0) {
+        const latest = entries[entries.length - 1];
+        const linux64 = path.join(
+          chromeCache,
+          latest,
+          "chrome-linux64",
+          "chrome",
+        );
+        if (fs.existsSync(linux64)) return linux64;
+        return path.join(chromeCache, latest, "chrome-linux", "chrome");
+      }
+    }
+    throw new Error(
+      "No se encontró Chrome/Chromium en Linux. Opciones:\n" +
+        "  1) Instalar Google Chrome (sudo apt install google-chrome-stable)\n" +
+        "  2) Instalar Chromium (sudo apt install chromium-browser)\n" +
+        "  3) Definir CHROME_PATH con la ruta del ejecutable",
+    );
   }
-  throw new Error(
-    "No se encontró Chrome/Chromium. Opciones:\n" +
-      "  1) Instalar Google Chrome para Linux (en WSL: descargar google-chrome-stable_current_amd64.deb e instalarlo con 'sudo dpkg -i')\n" +
-      "  2) Definir la variable de entorno CHROME_PATH con la ruta del ejecutable",
-  );
+
+  // --- Windows ---
+  if (platform === "win32") {
+    // Rutas directas
+    for (const candidate of CHROME_WINDOWS) {
+      const resolved = candidate.replace(
+        "%USERNAME%",
+        process.env.USERNAME || "",
+      );
+      if (fs.existsSync(resolved)) return resolved;
+    }
+    // Buscar en PATH + "where chrome" equivalente
+    const winEnv = process.env;
+    const programFiles = winEnv.ProgramFiles ?? String.raw`C:\Program Files`;
+    const programFilesX86 =
+      winEnv["ProgramFiles(x86)"] ?? String.raw`C:\Program Files (x86)`;
+    const localAppData =
+      winEnv.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
+
+    const candidates = [
+      path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(
+        programFilesX86,
+        "Google",
+        "Chrome",
+        "Application",
+        "chrome.exe",
+      ),
+      path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    // puppeteer cache Windows: ~/.cache/puppeteer/chrome/win64-<version>/chrome-win/chrome.exe
+    const chromeCache = path.join(
+      os.homedir(),
+      ".cache",
+      "puppeteer",
+      "chrome",
+    );
+    if (fs.existsSync(chromeCache)) {
+      const entries = fs
+        .readdirSync(chromeCache)
+        .sort()
+        .filter((entry) =>
+          fs.existsSync(
+            path.join(chromeCache, entry, "chrome-win", "chrome.exe"),
+          ),
+        );
+      if (entries.length > 0) {
+        const latest = entries[entries.length - 1];
+        return path.join(chromeCache, latest, "chrome-win", "chrome.exe");
+      }
+    }
+    throw new Error(
+      "No se encontró Google Chrome en Windows. Opciones:\n" +
+        "  1) Instalar Google Chrome desde https://www.google.com/chrome/\n" +
+        "  2) Definir CHROME_PATH con la ruta de chrome.exe",
+    );
+  }
+
+  // --- macOS (soporte básico por si acaso) ---
+  if (platform === "darwin") {
+    const macPaths = [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+    for (const candidate of macPaths) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    throw new Error(
+      "No se encontró Chrome/Chromium en macOS. Opciones:\n" +
+        "  1) Instalar Google Chrome\n" +
+        "  2) Definir CHROME_PATH con la ruta del ejecutable",
+    );
+  }
+
+  throw new Error(`Plataforma no soportada: ${platform}`);
 }
 
 class SRIScrapper {
@@ -283,6 +377,7 @@ class SRIScrapper {
   private browser?: Browser;
   private RUC!: string;
   private password!: string;
+  private downloadPath!: string;
   private state?: ExecutionState;
 
   /** Obtiene el estado de ejecución (crea uno nuevo si no existe). */
@@ -303,11 +398,16 @@ class SRIScrapper {
     this.browser = undefined;
     this.page = undefined;
     await this.InitScrapper();
-    await this.Login(this.RUC, this.password);
+    await this.Login(this.RUC, this.password, this.downloadPath);
     logger.info("Browser recreado y relogueado");
   }
 
   async InitScrapper() {
+    const userDataDir = path.join(os.tmpdir(), "sri-chromium");
+    const platform = os.platform();
+    // --no-sandbox solo en Linux (requisito root/WSL, no aplica en Windows/macOS)
+    const noSandbox = platform === "linux" ? ["--no-sandbox"] : [];
+
     this.browser = await puppeteer.launch({
       executablePath: resolveChromePath(),
       defaultViewport: {
@@ -317,15 +417,15 @@ class SRIScrapper {
       headless: false,
       args: [
         "--start-maximized",
-        "--no-sandbox",
-        "--user-data-dir=/tmp/chromium",
+        ...noSandbox,
+        `--user-data-dir=${userDataDir}`,
         "--disable-web-security",
         "--disable-features=site-per-process,DownloadBubble,DownloadBubbleV2",
         "--no-first-run",
         "--no-default-browser-check",
         "--incognito",
       ],
-      timeout: 120000,
+      timeout: NAVIGATION_TIMEOUT,
       slowMo: 10,
     });
     const userAgents = new UserAgents();
@@ -390,9 +490,10 @@ class SRIScrapper {
     });
   }
 
-  async Login(RUC: string, password: string) {
+  async Login(RUC: string, password: string, downloadPath: string = ".") {
     this.RUC = RUC;
     this.password = password;
+    this.downloadPath = path.resolve(downloadPath);
     if (!this.page) await this.InitScrapper();
     await this.NavigateToLogin();
     logger.info("Typing credentials...");
@@ -683,7 +784,12 @@ class SRIScrapper {
         logger.info("Downloading File...");
 
         const downloadPath = path.resolve(
-          `${this.RUC}/Comprobantes/retenciones/${year}/${Months[month]}/${claveAcceso}`,
+          this.downloadPath,
+          this.RUC,
+          "retenciones",
+          String(year),
+          Months[month],
+          claveAcceso,
         );
         logger.info({ downloadPath }, "DownloadPath");
         const pathExists = fs.existsSync(downloadPath);
@@ -1048,7 +1154,12 @@ class SRIScrapper {
         }
 
         const downloadPath = path.resolve(
-          `${this.RUC}/Comprobantes/Facturas/${year}/${Months[month]}/${factura.claveAcceso}`,
+          this.downloadPath,
+          this.RUC,
+          "Facturas",
+          String(year),
+          Months[month],
+          factura.claveAcceso,
         );
         logger.info({ downloadPath }, "DownloadPath");
         const pathExists = fs.existsSync(downloadPath);
@@ -1555,7 +1666,7 @@ class SRIScrapper {
 
   async EndScrapper() {
     this.state?.close();
-    // await this.browser?.close();
+    await this.browser?.close();
   }
 }
 
